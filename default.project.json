@@ -1,0 +1,33 @@
+{
+  "name": "MonsterGarden",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "Server": {
+        "$path": "src/server"
+      }
+    },
+    "StarterPlayerScripts": {
+      "$className": "StarterPlayerScripts",
+      "Client": {
+        "$path": "src/client"
+      }
+    },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Shared": {
+        "$path": "src/shared"
+      },
+      "Packages": {
+        "$path": "Packages"
+      }
+    },
+    "ReplicatedFirst": {
+      "$className": "ReplicatedFirst",
+      "ReplicatedFirst": {
+        "$path": "src/replicated-first"
+      }
+    }
+  }
+}
