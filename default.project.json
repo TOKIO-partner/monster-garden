@@ -8,26 +8,27 @@
         "$path": "src/server"
       }
     },
-    "StarterPlayerScripts": {
-      "$className": "StarterPlayerScripts",
-      "Client": {
-        "$path": "src/client"
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "Client": {
+          "$path": "src/client"
+        }
       }
     },
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
       "Shared": {
         "$path": "src/shared"
-      },
-      "Packages": {
-        "$path": "Packages"
       }
     },
     "ReplicatedFirst": {
       "$className": "ReplicatedFirst",
-      "ReplicatedFirst": {
-        "$path": "src/replicated-first"
-      }
+      "$path": "src/replicated-first"
+    },
+    "ServerStorage": {
+      "$className": "ServerStorage"
     }
   }
 }
