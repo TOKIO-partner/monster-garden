@@ -1,8 +1,8 @@
---!strict
 --[[
 	ShopService
 	GamePass購入処理、DevProduct購入処理、コインショップを担当するサービス。
 	MarketplaceService を使用し、購入完了時にプレイヤーデータを更新する。
+	v2: Remote を Net.lua 経由に統一。シード在庫は data.inventory.seeds を使用。
 ]]
 
 local MarketplaceService = game:GetService("MarketplaceService")
@@ -11,7 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local ShopPrices = require(Shared.Config.ShopPrices)
+local Net = require(Shared.Net)
 
 local ShopService = {}
 
@@ -19,90 +19,24 @@ local ShopService = {}
 
 --- GamePass ID マップ（本番環境では実際のIDに差し替える）
 local GAMEPASS_IDS = {
-	vip_pass       = 0,
-	mutation_4x    = 0,
+	vip_pass = 0,
+	mutation_4x = 0,
 	lucky_gardener = 0,
-	super_grow     = 0,
-	auto_water     = 0,
+	super_grow = 0,
+	auto_water = 0,
 }
 
 --- DevProduct ID マップ（本番環境では実際のIDに差し替える）
 local DEVPRODUCT_IDS = {
-	basic_egg       = 0,
-	gold_egg        = 0,
-	premium_seed_5  = 0,
+	basic_egg = 0,
+	gold_egg = 0,
+	premium_seed_5 = 0,
 	growth_boost_1h = 0,
 	instant_hatch_3 = 0,
-	garden_expand   = 0,
-	golden_soil_5   = 0,
-	deco_fantasy    = 0,
+	garden_expand = 0,
+	golden_soil_5 = 0,
+	deco_fantasy = 0,
 }
-
--- ------------------------------------------------------------------ init
-
---- ShopService を初期化する。
-function ShopService.init()
-	local DataService = require(ServerScriptService.Server.Services.DataService)
-
-	-- GamePass 購入完了ハンドラ
-	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, gamePassId, purchased)
-		if not purchased then return end
-		local passKey = nil
-		for key, id in pairs(GAMEPASS_IDS) do
-			if id == gamePassId then passKey = key break end
-		end
-		if passKey then
-			local data = DataService.getData(player)
-			if data then
-				data.gamePasses[passKey] = true
-				print("[ShopService] " .. player.Name .. " purchased GamePass: " .. passKey)
-			end
-		end
-	end)
-
-	-- DevProduct 購入処理（ProcessReceipt）
-	MarketplaceService.ProcessReceipt = function(receiptInfo)
-		local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
-		if not player then return Enum.ProductPurchaseDecision.NotProcessedYet end
-		local data = DataService.getData(player)
-		if not data then return Enum.ProductPurchaseDecision.NotProcessedYet end
-		local productKey = nil
-		for key, id in pairs(DEVPRODUCT_IDS) do
-			if id == receiptInfo.ProductId then productKey = key break end
-		end
-		if not productKey then return Enum.ProductPurchaseDecision.NotProcessedYet end
-		local success = ShopService.grantProduct(player, data, productKey, DataService)
-		if success then
-			print("[ShopService] " .. player.Name .. " purchased: " .. productKey)
-			return Enum.ProductPurchaseDecision.PurchaseGranted
-		end
-		return Enum.ProductPurchaseDecision.NotProcessedYet
-	end
-
-	-- プレイヤー入室時にGamePass所持チェック
-	Players.PlayerAdded:Connect(function(player)
-		task.wait(2)
-		ShopService.checkOwnedPasses(player, DataService)
-	end)
-
-	-- Remotes フォルダを確保
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	if not remotes then
-		remotes = Instance.new("Folder")
-		remotes.Name = "Remotes"
-		remotes.Parent = ReplicatedStorage
-	end
-
-	-- BuySeed リモートイベント（コイン購入）
-	local buySeedRemote = Instance.new("RemoteEvent")
-	buySeedRemote.Name = "BuySeed"
-	buySeedRemote.Parent = remotes
-	buySeedRemote.OnServerEvent:Connect(function(player, seedId)
-		ShopService.buySeedWithCoins(player, seedId, DataService)
-	end)
-
-	print("[ShopService] Initialized")
-end
 
 -- ------------------------------------------------------------------ grant product
 
@@ -120,10 +54,10 @@ function ShopService.grantProduct(player, data, productKey, DataService)
 		DataService.addCoins(player, 2000)
 		return true
 	elseif productKey == "premium_seed_5" then
-		table.insert(data.seeds, "rainbow_seed")
+		table.insert(data.inventory.seeds, "rainbow_seed")
 		local types = { "fire_seed", "water_seed", "grass_seed", "light_seed", "dark_seed" }
 		for _ = 1, 4 do
-			table.insert(data.seeds, types[math.random(#types)])
+			table.insert(data.inventory.seeds, types[math.random(#types)])
 		end
 		return true
 	elseif productKey == "growth_boost_1h" then
@@ -153,7 +87,9 @@ end
 ---@param DataService table
 function ShopService.checkOwnedPasses(player, DataService)
 	local data = DataService.getData(player)
-	if not data then return end
+	if not data then
+		return
+	end
 	for passKey, passId in pairs(GAMEPASS_IDS) do
 		if passId > 0 then
 			local ok, owns = pcall(function()
@@ -176,15 +112,90 @@ function ShopService.buySeedWithCoins(player, seedId, DataService)
 	local SeedDatabase = require(Shared.Config.SeedDatabase)
 	local seedData = nil
 	for _, seed in pairs(SeedDatabase) do
-		if seed.id == seedId then seedData = seed break end
+		if seed.id == seedId then
+			seedData = seed
+			break
+		end
 	end
-	if not seedData or seedData.cost <= 0 then return end
+	-- robux 建てシードはコイン購入不可
+	if not seedData or seedData.cost <= 0 or seedData.currencyType ~= "coins" then
+		return
+	end
 	if DataService.spendCoins(player, seedData.cost) then
 		local data = DataService.getData(player)
 		if data then
-			table.insert(data.seeds, seedId)
+			table.insert(data.inventory.seeds, seedId)
 		end
 	end
+end
+
+-- ------------------------------------------------------------------ init
+
+--- ShopService を初期化する。
+function ShopService.init()
+	local DataService = require(ServerScriptService.Server.Services.DataService)
+
+	-- GamePass 購入完了ハンドラ
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, gamePassId, purchased)
+		if not purchased then
+			return
+		end
+		local passKey = nil
+		for key, id in pairs(GAMEPASS_IDS) do
+			if id == gamePassId then
+				passKey = key
+				break
+			end
+		end
+		if passKey then
+			local data = DataService.getData(player)
+			if data then
+				data.gamePasses[passKey] = true
+				print("[ShopService] " .. player.Name .. " purchased GamePass: " .. passKey)
+			end
+		end
+	end)
+
+	-- DevProduct 購入処理（ProcessReceipt）
+	MarketplaceService.ProcessReceipt = function(receiptInfo)
+		local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
+		if not player then
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+		local data = DataService.getData(player)
+		if not data then
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+		local productKey = nil
+		for key, id in pairs(DEVPRODUCT_IDS) do
+			if id == receiptInfo.ProductId then
+				productKey = key
+				break
+			end
+		end
+		if not productKey then
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+		local success = ShopService.grantProduct(player, data, productKey, DataService)
+		if success then
+			print("[ShopService] " .. player.Name .. " purchased: " .. productKey)
+			return Enum.ProductPurchaseDecision.PurchaseGranted
+		end
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	-- プレイヤー入室時にGamePass所持チェック
+	Players.PlayerAdded:Connect(function(player)
+		task.wait(2)
+		ShopService.checkOwnedPasses(player, DataService)
+	end)
+
+	-- シードのコイン購入
+	Net.event("BuySeed").OnServerEvent:Connect(function(player, seedId)
+		ShopService.buySeedWithCoins(player, seedId, DataService)
+	end)
+
+	print("[ShopService] Initialized")
 end
 
 return ShopService
