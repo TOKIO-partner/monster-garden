@@ -4,7 +4,10 @@
 #
 # 前提（jurassic/deep-sea と同パターン）:
 #   - Universe/Place は Storix_Dev（UserId 10710842340）所有で作成済みであること
-#     （初回のみ Studio で「Publish to Roblox As...」が必要。Open Cloud に Universe 作成 API は無い）
+#     （初回作成も Mantle で自動化可能: mantle.yml + `mantle deploy --environment production`。
+#       認証は ../scripts/extract-studio-cookie.py で Studio cookie を ROBLOSECURITY に export、
+#       Place アップロードは MANTLE_OPEN_CLOUD_API_KEY を併用。
+#       公開化(activate)のみ Creator Hub の Questionnaire 提出後に可能）
 #   - .env に以下を設定:
 #       RBXCLOUD_API_KEY   （universe-places:write 権限）
 #       UNIVERSE_ID
