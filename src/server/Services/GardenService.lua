@@ -1,184 +1,246 @@
 --[[
 	GardenService
-	ガーデンの成長ロジック、植付け、水やり、孵化を担当するサービス。
-	DataService に依存してプレイヤーデータを読み書きする。
+	プレイヤーの庭園島（空中プライベート島）の割当・生成と、
+	植付け・水やり・孵化・成長ティックを担当するサービス。
+	v2: 成長計算を Lib/GrowthLogic に委譲。データは data.garden.plots /
+	data.inventory.seeds（スキーマ v2）を使用。島は島スロット毎に
+	CFrame オフセット配置し、StreamingEnabled で自動ストリーミングする。
 ]]
 
-local Players          = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local GameConfig = require(game.ReplicatedStorage.Shared.Config.GameConfig)
+local SeedDatabase = require(game.ReplicatedStorage.Shared.Config.SeedDatabase)
+local Net = require(game.ReplicatedStorage.Shared.Net)
+local GrowthLogic = require(ServerScriptService.Server.Lib.GrowthLogic)
 
 -- ------------------------------------------------------------------ constants
 
---- 成長ステージ定義（順序が重要）
-local GROWTH_STAGES = {
-	"Seed",      -- 1
-	"Sprout",    -- 2
-	"Bud",       -- 3
-	"Egg",       -- 4  ← タップが必要。自動進行しない
-	"Juvenile",  -- 5
-	"Adult",     -- 6
-	"Ultimate",  -- 7  ← 最終形。自動進行しない
-}
-
---- ステージインデックスの逆引きマップ
-local STAGE_INDEX = {}
-for i, stage in ipairs(GROWTH_STAGES) do
-	STAGE_INDEX[stage] = i
-end
-
---- 各ステージから次のステージに進むのに必要な秒数（GameConfig.Growth から取得）
-local STAGE_DURATIONS = {
-	Seed    = GameConfig.Growth.SeedToSprout,    -- 300
-	Sprout  = GameConfig.Growth.SproutToBud,     -- 900
-	Bud     = GameConfig.Growth.BudToEgg,        -- 1800
-	Egg     = GameConfig.Growth.EggToHatch,      -- 0  (手動孵化のため使用しない)
-	Juvenile = GameConfig.Growth.HatchToJuvenile, -- 3600
-	Adult   = GameConfig.Growth.JuvenileToAdult, -- 7200
-}
-
 --- super_grow ゲームパスの成長速度倍率
 local SUPER_GROW_MULTIPLIER = 2.0
-
---- 水やりによるボーナス秒数
+--- 水やりによる成長ボーナス秒数
 local WATER_BONUS_SECONDS = 60
-
---- GrowthTickInterval（秒）
-local GROWTH_TICK_INTERVAL = GameConfig.Garden.GrowthTickInterval  -- 1
+--- 成長ティック間隔（秒）
+local GROWTH_TICK_INTERVAL = GameConfig.Garden.GrowthTickInterval
+--- 島のベースサイズ（studs）
+local ISLAND_SIZE = 128
+--- プロット1マスのサイズ（studs）
+local PLOT_SIZE = 8
 
 -- ------------------------------------------------------------------ module
 
 local GardenService = {}
 
--- DataService への参照（init 時に取得）
+-- 遅延解決するサービス参照
 local DataService
 
--- 各プレイヤーの成長ティックタイマー: player.UserId → 累積秒数
-local tickTimers = {}
-
--- ------------------------------------------------------------------ utility
-
---- SeedDatabase をキャッシュ（require は一度だけ）
-local SeedDatabase = require(game.ReplicatedStorage.Shared.Config.SeedDatabase)
-
---- シード ID → シードデータのマップを構築する。
+--- seedId → シードデータ
 local seedMap = {}
 for _, seed in ipairs(SeedDatabase) do
 	seedMap[seed.id] = seed
 end
 
---- RemoteEvent を取得するヘルパー。Remotes フォルダが存在することを前提とする。
----@param name string
----@return RemoteEvent|nil
-local function getRemoteEvent(name)
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	if not remotes then return nil end
-	return remotes:FindFirstChild(name)
+--- プレイヤー毎の成長ティックタイマー: userId → number
+local tickTimers = {}
+
+--- 島スロット割当: userId → slotIndex
+local islandSlots = {}
+--- 使用中スロット: slotIndex → userId
+local usedSlots = {}
+
+--- 生成済み島モデル: userId → Model
+local islandModels = {}
+
+-- ------------------------------------------------------------------ island geometry
+
+--- スロット番号から島の中心CFrameを返す。
+--- 島は空中 IslandHeight に IslandSpacing 間隔で1列配置する。
+---@param slotIndex number
+---@return CFrame
+local function islandCFrame(slotIndex)
+	local world = GameConfig.World
+	return CFrame.new(slotIndex * world.IslandSpacing, world.IslandHeight, 0)
 end
 
---- プレイヤーが super_grow ゲームパスを持っているか確認する。
+--- プロット番号（1-9、3×3）から島中心からのオフセットを返す。
+---@param plotIndex number
+---@return Vector3
+local function plotOffset(plotIndex)
+	local size = GameConfig.Garden.InitialSize -- 3
+	local row = math.floor((plotIndex - 1) / size)
+	local column = (plotIndex - 1) % size
+	local origin = -(size - 1) / 2 * PLOT_SIZE
+	return Vector3.new(origin + column * PLOT_SIZE, 1, origin + row * PLOT_SIZE)
+end
+
+--- プレイヤーの庭園島を生成する（ベース地形＋プロットPart＋スポーン台）。
+---@param player Player
+---@param slotIndex number
+---@return Model
+local function buildIsland(player, slotIndex)
+	local island = Instance.new("Model")
+	island.Name = "Island_" .. player.UserId
+
+	local center = islandCFrame(slotIndex)
+
+	-- ベース地面
+	local base = Instance.new("Part")
+	base.Name = "Base"
+	base.Size = Vector3.new(ISLAND_SIZE, 4, ISLAND_SIZE)
+	base.CFrame = center
+	base.Anchored = true
+	base.Material = Enum.Material.Grass
+	base.Color = Color3.fromRGB(106, 170, 100)
+	base.Parent = island
+
+	-- 3×3 プロット
+	for plotIndex = 1, GameConfig.Garden.MaxPlots do
+		local plot = Instance.new("Part")
+		plot.Name = "Plot_" .. plotIndex
+		plot.Size = Vector3.new(PLOT_SIZE - 1, 1, PLOT_SIZE - 1)
+		plot.CFrame = center + plotOffset(plotIndex) + Vector3.new(0, 2, 0)
+		plot.Anchored = true
+		plot.Material = Enum.Material.Ground
+		plot.Color = Color3.fromRGB(124, 92, 62)
+		plot.Parent = island
+
+		-- クライアント操作用属性
+		plot:SetAttribute("PlotIndex", plotIndex)
+		plot:SetAttribute("OwnerUserId", player.UserId)
+
+		-- プロットのタップ操作（サーバー側で発火・スマートアクション）
+		local clickDetector = Instance.new("ClickDetector")
+		clickDetector.MaxActivationDistance = 24
+		clickDetector.Parent = plot
+		clickDetector.MouseClick:Connect(function(clicker)
+			GardenService.handlePlotClick(clicker, player.UserId, plotIndex)
+		end)
+	end
+
+	-- ワープ台（ワールドへ戻る）
+	local warpPad = Instance.new("Part")
+	warpPad.Name = "WarpPad"
+	warpPad.Size = Vector3.new(6, 1, 6)
+	warpPad.CFrame = center + Vector3.new(0, 2.5, ISLAND_SIZE / 2 - 8)
+	warpPad.Anchored = true
+	warpPad.Material = Enum.Material.Neon
+	warpPad.Color = Color3.fromRGB(85, 170, 255)
+	warpPad.Parent = island
+
+	island.Parent = workspace
+	return island
+end
+
+-- ------------------------------------------------------------------ island API
+
+--- プレイヤーに島スロットを割当て、島を生成する。
+---@param player Player
+---@return number slotIndex
+function GardenService.assignIsland(player)
+	if islandSlots[player.UserId] then
+		return islandSlots[player.UserId]
+	end
+
+	-- 空きスロットを探す
+	for slotIndex = 1, GameConfig.World.MaxIslandSlots do
+		if not usedSlots[slotIndex] then
+			usedSlots[slotIndex] = player.UserId
+			islandSlots[player.UserId] = slotIndex
+			islandModels[player.UserId] = buildIsland(player, slotIndex)
+			print(string.format("[GardenService] %s assigned island slot %d", player.Name, slotIndex))
+			return slotIndex
+		end
+	end
+
+	warn("[GardenService] No free island slot for " .. player.Name)
+	return 0
+end
+
+--- プレイヤーの島スロットを解放し、島モデルを破棄する。
+---@param player Player
+function GardenService.releaseIsland(player)
+	local slotIndex = islandSlots[player.UserId]
+	if slotIndex then
+		usedSlots[slotIndex] = nil
+		islandSlots[player.UserId] = nil
+	end
+	if islandModels[player.UserId] then
+		islandModels[player.UserId]:Destroy()
+		islandModels[player.UserId] = nil
+	end
+	tickTimers[player.UserId] = nil
+end
+
+--- プレイヤーの島のスポーン位置（CFrame）を返す。未割当なら nil。
+---@param player Player
+---@return CFrame|nil
+function GardenService.getIslandSpawn(player)
+	local slotIndex = islandSlots[player.UserId]
+	if not slotIndex then
+		return nil
+	end
+	return islandCFrame(slotIndex) + Vector3.new(0, 6, 0)
+end
+
+-- ------------------------------------------------------------------ helpers
+
+--- プレイヤーが super_grow パスを保持しているか。
 ---@param player Player
 ---@return boolean
 local function hasSuperGrow(player)
 	local data = DataService.getData(player)
-	if not data then return false end
-	return data.gamePasses and data.gamePasses["super_grow"] == true
-end
-
---- 指定ステージの次のステージ名を返す。存在しない場合は nil を返す。
----@param stage string
----@return string|nil
-local function nextStage(stage)
-	local idx = STAGE_INDEX[stage]
-	if not idx then return nil end
-	return GROWTH_STAGES[idx + 1]
-end
-
--- ------------------------------------------------------------------ remote setup
-
---- GardenService 用の RemoteEvent を ReplicatedStorage/Remotes に作成する。
-local function setupRemotes()
-	local remotes = ReplicatedStorage:WaitForChild("Remotes")
-
-	local eventNames = { "PlantSeed", "WaterPlot", "HatchEgg", "GardenUpdate", "MonsterHatched" }
-	for _, name in ipairs(eventNames) do
-		if not remotes:FindFirstChild(name) then
-			local re = Instance.new("RemoteEvent")
-			re.Name = name
-			re.Parent = remotes
-		end
-	end
+	return data ~= nil and data.gamePasses ~= nil and data.gamePasses.super_grow == true
 end
 
 -- ------------------------------------------------------------------ offline growth
 
---- オフライン成長を処理する。
---- プレイヤーが離席していた秒数を全プロットに適用し、ステージを進める。
---- Egg ステージでは停止する（手動孵化が必要）。
+--- オフライン成長を処理する。Egg / Ultimate ステージでは停止する。
 ---@param player Player
 function GardenService.processOfflineGrowth(player)
 	local data = DataService.getData(player)
-	if not data then return end
-
-	local offlineSeconds = data._offlineSeconds or 0
-	if offlineSeconds <= 0 then return end
-
-	-- super_grow は接続中にのみ適用（オフライン中は等速）
-	local elapsed = offlineSeconds
-
-	for plotIndex, plot in pairs(data.garden) do
-		if type(plot) == "table" and plot.stage then
-			local remaining = elapsed
-
-			-- Egg・Ultimate では停止
-			while remaining > 0 and plot.stage ~= "Egg" and plot.stage ~= "Ultimate" do
-				local duration = STAGE_DURATIONS[plot.stage]
-				if not duration or duration <= 0 then break end
-
-				local needed = duration - (plot.growthProgress or 0)
-				if remaining >= needed then
-					-- 次のステージへ
-					remaining = remaining - needed
-					local ns = nextStage(plot.stage)
-					if ns then
-						plot.stage = ns
-						plot.growthProgress = 0
-						plot.watered = false
-						-- Egg に到達したら停止
-						if plot.stage == "Egg" then
-							break
-						end
-					else
-						break
-					end
-				else
-					plot.growthProgress = (plot.growthProgress or 0) + remaining
-					remaining = 0
-				end
-			end
-		end
+	if not data then
+		return
 	end
 
-	-- オフライン秒数を消費済みにする
+	local offlineSeconds = data._offlineSeconds or 0
+	if offlineSeconds <= 0 or not GameConfig.Garden.OfflineGrowthEnabled then
+		return
+	end
+
+	local changedPlots = GrowthLogic.applyOfflineGrowth(data.garden.plots, offlineSeconds, GameConfig.Growth)
+
+	for plotIndex in pairs(changedPlots) do
+		Net.event("GardenUpdate"):FireClient(player, "stageChange", plotIndex, data.garden.plots[plotIndex])
+	end
+
 	data._offlineSeconds = 0
-	print(string.format("[GardenService] Offline growth applied for %s (%ds)", player.Name, elapsed))
+	print(string.format("[GardenService] %s offline growth applied (%d sec)", player.Name, offlineSeconds))
 end
 
 -- ------------------------------------------------------------------ plant seed
 
 --- 指定プロットに種を植える。
---- プロットが空でなければ失敗。所持していない場合はコインで購入試行。
 ---@param player Player
 ---@param plotIndex number
 ---@param seedId string
 ---@return boolean, string
 function GardenService.plantSeed(player, plotIndex, seedId)
+	-- 引数検証（クライアント不信頼）
+	if type(plotIndex) ~= "number" or plotIndex < 1 or plotIndex > GameConfig.Garden.MaxPlots then
+		return false, "invalid_plot"
+	end
+	if type(seedId) ~= "string" then
+		return false, "invalid_seed"
+	end
+
 	local data = DataService.getData(player)
-	if not data then return false, "no_data" end
+	if not data then
+		return false, "no_data"
+	end
 
 	-- プロット空きチェック
-	if data.garden[plotIndex] then
+	if data.garden.plots[plotIndex] then
 		return false, "plot_occupied"
 	end
 
@@ -188,13 +250,13 @@ function GardenService.plantSeed(player, plotIndex, seedId)
 		return false, "invalid_seed"
 	end
 
-	-- 所持種チェック
+	-- 所持種チェック（所持していれば消費）
 	local hasSeed = false
-	local seedInventory = data.seeds or {}
-	for i, ownedSeedId in ipairs(seedInventory) do
+	local seedInventory = data.inventory.seeds
+	for index, ownedSeedId in ipairs(seedInventory) do
 		if ownedSeedId == seedId then
 			hasSeed = true
-			table.remove(seedInventory, i)
+			table.remove(seedInventory, index)
 			break
 		end
 	end
@@ -202,8 +264,7 @@ function GardenService.plantSeed(player, plotIndex, seedId)
 	-- 所持していない場合はコインで購入
 	if not hasSeed then
 		if seedData.currencyType == "coins" then
-			local spent = DataService.spendCoins(player, seedData.cost)
-			if not spent then
+			if not DataService.spendCoins(player, seedData.cost) then
 				return false, "insufficient_coins"
 			end
 		else
@@ -213,23 +274,17 @@ function GardenService.plantSeed(player, plotIndex, seedId)
 	end
 
 	-- プロットデータ作成
-	data.garden[plotIndex] = {
-		seedId        = seedId,
-		stage         = "Seed",
+	data.garden.plots[plotIndex] = {
+		seedId = seedId,
+		stage = "Seed",
 		growthProgress = 0,
-		soilType      = "Normal",
-		plantedAt     = os.time(),
-		watered       = false,
+		soilType = "Normal",
+		plantedAt = os.time(),
+		watered = false,
 	}
 
 	print(string.format("[GardenService] %s planted %s at plot %d", player.Name, seedId, plotIndex))
-
-	-- クライアントへ通知
-	local gardenUpdate = getRemoteEvent("GardenUpdate")
-	if gardenUpdate then
-		gardenUpdate:FireClient(player, "plant", plotIndex, data.garden[plotIndex])
-	end
-
+	Net.event("GardenUpdate"):FireClient(player, "plant", plotIndex, data.garden.plots[plotIndex])
 	return true, "ok"
 end
 
@@ -240,124 +295,122 @@ end
 ---@param plotIndex number
 ---@return boolean, string
 function GardenService.waterPlot(player, plotIndex)
-	local data = DataService.getData(player)
-	if not data then return false, "no_data" end
-
-	local plot = data.garden[plotIndex]
-	if not plot then return false, "no_plot" end
-	if plot.watered then return false, "already_watered" end
-
-	plot.watered = true
-	plot.growthProgress = (plot.growthProgress or 0) + WATER_BONUS_SECONDS
-
-	print(string.format("[GardenService] %s watered plot %d (+%ds)", player.Name, plotIndex, WATER_BONUS_SECONDS))
-
-	local gardenUpdate = getRemoteEvent("GardenUpdate")
-	if gardenUpdate then
-		gardenUpdate:FireClient(player, "water", plotIndex, plot)
+	if type(plotIndex) ~= "number" then
+		return false, "invalid_plot"
 	end
 
+	local data = DataService.getData(player)
+	if not data then
+		return false, "no_data"
+	end
+
+	local plot = data.garden.plots[plotIndex]
+	if not plot then
+		return false, "no_plot"
+	end
+	if plot.watered then
+		return false, "already_watered"
+	end
+	if GrowthLogic.isManualStage(plot.stage) then
+		return false, "cannot_water"
+	end
+
+	plot.watered = true
+	local changed = GrowthLogic.advance(plot, WATER_BONUS_SECONDS, 1.0, GameConfig.Growth)
+	-- watered フラグは advance でステージ変化時にリセットされるため再設定
+	if not changed then
+		plot.watered = true
+	end
+
+	local updateKind = changed and "stageChange" or "water"
+	Net.event("GardenUpdate"):FireClient(player, updateKind, plotIndex, plot)
 	return true, "ok"
 end
 
 -- ------------------------------------------------------------------ hatch egg
 
---- Egg ステージのプロットを孵化させる。
---- MonsterService.rollMonster を呼び、モンスターをプレイヤーに追加する。
+--- Egg ステージのプロットを孵化させ、モンスターを付与する。
 ---@param player Player
 ---@param plotIndex number
 ---@return boolean, string
 function GardenService.hatchEgg(player, plotIndex)
-	local data = DataService.getData(player)
-	if not data then return false, "no_data" end
+	if type(plotIndex) ~= "number" then
+		return false, "invalid_plot"
+	end
 
-	local plot = data.garden[plotIndex]
-	if not plot then return false, "no_plot" end
-	if plot.stage ~= "Egg" then return false, "not_egg" end
+	local data = DataService.getData(player)
+	if not data then
+		return false, "no_data"
+	end
+
+	local plot = data.garden.plots[plotIndex]
+	if not plot then
+		return false, "no_plot"
+	end
+	if plot.stage ~= "Egg" then
+		return false, "not_egg"
+	end
 
 	-- MonsterService からモンスターをロール
-	local MonsterService = require(game.ServerScriptService.Server.Services.MonsterService)
+	local MonsterService = require(ServerScriptService.Server.Services.MonsterService)
 	local monster = MonsterService.rollMonster(player, plot.seedId, plot.soilType)
 	if not monster then
 		return false, "roll_failed"
 	end
 
-	-- モンスター追加
-	if not data.monsters then data.monsters = {} end
+	-- モンスター追加・図鑑・統計更新
 	table.insert(data.monsters, monster)
-
-	-- コレクション更新
-	if not data.collection then data.collection = {} end
 	data.collection[monster.id] = true
-
-	-- 統計更新
-	data.stats.totalMonsters = (data.stats.totalMonsters or 0) + 1
-
-	-- leaderstats 更新
-	local ls = player:FindFirstChild("leaderstats")
-	if ls and ls:FindFirstChild("Monsters") then
-		ls.Monsters.Value = data.stats.totalMonsters
-	end
+	DataService.incrementStat(player, "totalMonsters")
 
 	-- Egg → Juvenile に進める
 	plot.stage = "Juvenile"
 	plot.growthProgress = 0
 	plot.watered = false
 
-	print(string.format("[GardenService] %s hatched %s from plot %d", player.Name, monster.id, plotIndex))
+	print(string.format("[GardenService] %s hatched %s at plot %d", player.Name, monster.id, plotIndex))
 
-	-- MonsterHatched イベント
-	local monsterHatched = getRemoteEvent("MonsterHatched")
-	if monsterHatched then
-		monsterHatched:FireClient(player, monster, plotIndex)
-	end
-
-	-- GardenUpdate イベント
-	local gardenUpdate = getRemoteEvent("GardenUpdate")
-	if gardenUpdate then
-		gardenUpdate:FireClient(player, "hatch", plotIndex, plot)
-	end
-
+	Net.event("MonsterHatched"):FireClient(player, monster, plotIndex)
+	Net.event("GardenUpdate"):FireClient(player, "hatch", plotIndex, plot)
 	return true, "ok"
+end
+
+-- ------------------------------------------------------------------ plot click (smart action)
+
+--- プロットタップ時のスマートアクション。
+--- 空 → 手持ち先頭の種を植える / Egg → 孵化 / 成長中 → 水やり。
+--- 所有者本人のみ操作可能（サーバー検証）。
+---@param clicker Player タップしたプレイヤー
+---@param ownerUserId number プロット所有者の UserId
+---@param plotIndex number
+function GardenService.handlePlotClick(clicker, ownerUserId, plotIndex)
+	-- 所有者検証
+	if clicker.UserId ~= ownerUserId then
+		return
+	end
+
+	local data = DataService.getData(clicker)
+	if not data then
+		return
+	end
+
+	local plot = data.garden.plots[plotIndex]
+	if not plot then
+		-- 空プロット: 手持ち先頭の種を植える
+		local firstSeed = data.inventory.seeds[1]
+		if firstSeed then
+			GardenService.plantSeed(clicker, plotIndex, firstSeed)
+		end
+	elseif plot.stage == "Egg" then
+		GardenService.hatchEgg(clicker, plotIndex)
+	else
+		GardenService.waterPlot(clicker, plotIndex)
+	end
 end
 
 -- ------------------------------------------------------------------ growth tick
 
---- 単一プロットの成長を dt 秒分進める。ステージが変化したら true を返す。
----@param plot table
----@param dt number
----@param multiplier number
----@return boolean stageChanged
-local function tickPlot(plot, dt, multiplier)
-	-- Egg・Ultimate は自動進行しない
-	if plot.stage == "Egg" or plot.stage == "Ultimate" then
-		return false
-	end
-
-	local duration = STAGE_DURATIONS[plot.stage]
-	if not duration or duration <= 0 then
-		return false
-	end
-
-	plot.growthProgress = (plot.growthProgress or 0) + dt * multiplier
-
-	if plot.growthProgress >= duration then
-		local ns = nextStage(plot.stage)
-		if ns then
-			plot.stage = ns
-			plot.growthProgress = 0
-			plot.watered = false
-			return true
-		end
-	end
-
-	return false
-end
-
--- ------------------------------------------------------------------ update (game loop)
-
---- ゲームループから毎フレーム呼ばれる成長処理。
---- GROWTH_TICK_INTERVAL 秒ごとに全プレイヤーの全プロットを更新する。
+--- 全プレイヤーの庭園を dt 秒分成長させる。init.server.lua の Heartbeat から呼ばれる。
 ---@param dt number
 function GardenService.update(dt)
 	for _, player in ipairs(Players:GetPlayers()) do
@@ -369,22 +422,17 @@ function GardenService.update(dt)
 			tickTimers[userId] = 0
 
 			local data = DataService.getData(player)
-			if data and data.garden then
+			if data and data.garden and data.garden.plots then
 				local multiplier = hasSuperGrow(player) and SUPER_GROW_MULTIPLIER or 1.0
 
-				for plotIndex, plot in pairs(data.garden) do
+				for plotIndex, plot in pairs(data.garden.plots) do
 					if type(plot) == "table" then
-						local changed = tickPlot(plot, tickDt, multiplier)
+						local changed = GrowthLogic.advance(plot, tickDt, multiplier, GameConfig.Growth)
 						if changed then
-							-- ステージ変化をクライアントへ通知
-							local gardenUpdate = getRemoteEvent("GardenUpdate")
-							if gardenUpdate then
-								gardenUpdate:FireClient(player, "stageChange", plotIndex, plot)
-							end
-							print(string.format(
-								"[GardenService] %s plot %d → %s",
-								player.Name, plotIndex, plot.stage
-							))
+							Net.event("GardenUpdate"):FireClient(player, "stageChange", plotIndex, plot)
+							print(
+								string.format("[GardenService] %s plot %d → %s", player.Name, plotIndex, plot.stage)
+							)
 						end
 					end
 				end
@@ -397,42 +445,42 @@ end
 
 --- GardenService を初期化する。
 function GardenService.init()
-	-- DataService 参照を取得
-	DataService = require(game.ServerScriptService.Server.Services.DataService)
+	DataService = require(ServerScriptService.Server.Services.DataService)
 
-	-- Remotes セットアップ
-	setupRemotes()
-
-	-- PlantSeed リモートイベント
-	local remotes = ReplicatedStorage:WaitForChild("Remotes")
-
-	remotes:WaitForChild("PlantSeed").OnServerEvent:Connect(function(player, plotIndex, seedId)
+	-- Remote ハンドラ
+	Net.event("PlantSeed").OnServerEvent:Connect(function(player, plotIndex, seedId)
 		GardenService.plantSeed(player, plotIndex, seedId)
 	end)
 
-	remotes:WaitForChild("WaterPlot").OnServerEvent:Connect(function(player, plotIndex)
+	Net.event("WaterPlot").OnServerEvent:Connect(function(player, plotIndex)
 		GardenService.waterPlot(player, plotIndex)
 	end)
 
-	remotes:WaitForChild("HatchEgg").OnServerEvent:Connect(function(player, plotIndex)
+	Net.event("HatchEgg").OnServerEvent:Connect(function(player, plotIndex)
 		GardenService.hatchEgg(player, plotIndex)
 	end)
 
-	-- PlayerAdded: オフライン成長を処理
+	-- プレイヤー入室: 島割当＋オフライン成長
 	Players.PlayerAdded:Connect(function(player)
-		-- DataService.loadData が完了するまで待つ
-		task.wait(1)
+		-- DataService.loadData の完了を待つ（キャッシュ生成まで最大10秒）
+		local waited = 0
+		while not DataService.getData(player) and waited < 10 do
+			waited = waited + task.wait(0.2)
+		end
+		GardenService.assignIsland(player)
 		GardenService.processOfflineGrowth(player)
 	end)
 
-	-- 既に入室済みプレイヤーの処理
 	for _, player in ipairs(Players:GetPlayers()) do
-		task.spawn(function()
-			GardenService.processOfflineGrowth(player)
-		end)
+		GardenService.assignIsland(player)
 	end
 
-	print("[GardenService] Initialized.")
+	-- プレイヤー退室: 島解放
+	Players.PlayerRemoving:Connect(function(player)
+		GardenService.releaseIsland(player)
+	end)
+
+	print("[GardenService] Initialized")
 end
 
 return GardenService

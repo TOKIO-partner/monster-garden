@@ -1,4 +1,3 @@
---!strict
 --[[
 	init.client.lua
 	クライアント側エントリポイント。全コントローラを順番に初期化する。
@@ -27,7 +26,9 @@ end
 
 --- モジュールの init() を安全に呼ぶ。失敗時は警告のみ。
 local function safeInit(mod, name)
-	if not mod or not mod.init then return end
+	if not mod or not mod.init then
+		return
+	end
 	local ok, err = pcall(function()
 		mod.init()
 	end)
@@ -40,14 +41,23 @@ end
 
 print("[Client] === Monster Garden Client Starting ===")
 
-local UIController         = safeRequire(script.Controllers.UIController,         "UIController")
-local GardenController     = safeRequire(script.Controllers.GardenController,     "GardenController")
-local ShopController       = safeRequire(script.Controllers.ShopController,       "ShopController")
+local UIController = safeRequire(script.Controllers.UIController, "UIController")
+local WorldController = safeRequire(script.Controllers.WorldController, "WorldController")
+local GardenController = safeRequire(script.Controllers.GardenController, "GardenController")
+local CaptureController = safeRequire(script.Controllers.CaptureController, "CaptureController")
+local ShopController = safeRequire(script.Controllers.ShopController, "ShopController")
 local CollectionController = safeRequire(script.Controllers.CollectionController, "CollectionController")
 
-safeInit(UIController,         "UIController")
-safeInit(GardenController,     "GardenController")
-safeInit(ShopController,       "ShopController")
+safeInit(UIController, "UIController")
+safeInit(WorldController, "WorldController")
+safeInit(GardenController, "GardenController")
+safeInit(CaptureController, "CaptureController")
+safeInit(ShopController, "ShopController")
 safeInit(CollectionController, "CollectionController")
+
+-- 捕獲トーストを UIController に接続
+if CaptureController and UIController then
+	CaptureController.setToastHandler(UIController.showToast)
+end
 
 print("[Client] === Monster Garden Client Ready ===")

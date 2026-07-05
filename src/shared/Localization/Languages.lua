@@ -43,6 +43,21 @@ local translations = {
 		tap_to_hatch = "タップして孵化させよう！",
 		not_enough_coins = "コインが足りません！",
 		monster_obtained = "モンスターをゲット！",
+
+		-- Growth stage (v2 additions)
+		stage_ultimate = "究極体",
+
+		-- Capture
+		capture_success = "つかまえた！",
+		capture_escaped = "にげられた…",
+		capture_prompt = "つかまえる",
+
+		-- Warp / world
+		warp_to_island = "🏝 じぶんの庭園へ",
+		warp_to_world = "🌍 ワールドへ",
+		biome_meadow = "そよかぜ草原",
+		biome_volcano = "ごうか火山",
+		biome_lakeside = "みずうみのほとり",
 	},
 	en = {
 		-- UI general
@@ -85,6 +100,21 @@ local translations = {
 		tap_to_hatch = "Tap to hatch!",
 		not_enough_coins = "Not enough coins!",
 		monster_obtained = "Monster obtained!",
+
+		-- Growth stage (v2 additions)
+		stage_ultimate = "Ultimate",
+
+		-- Capture
+		capture_success = "Captured!",
+		capture_escaped = "It escaped...",
+		capture_prompt = "Capture",
+
+		-- Warp / world
+		warp_to_island = "🏝 My Garden",
+		warp_to_world = "🌍 World",
+		biome_meadow = "Breezy Meadow",
+		biome_volcano = "Blazing Volcano",
+		biome_lakeside = "Misty Lakeside",
 	},
 }
 
@@ -109,6 +139,21 @@ function Languages.getText(key, lang)
 
 	-- Last resort: return the key itself
 	return key
+end
+
+--- Returns the localized string using the local player's locale (client only).
+-- Japanese locale → "ja", everything else → "en".
+-- @param key string  The localization key
+-- @return string  The localized text
+function Languages.get(key)
+	local lang = "en"
+	local ok, localeId = pcall(function()
+		return game:GetService("LocalizationService").RobloxLocaleId
+	end)
+	if ok and localeId and string.sub(localeId, 1, 2) == "ja" then
+		lang = "ja"
+	end
+	return Languages.getText(key, lang)
 end
 
 return Languages
