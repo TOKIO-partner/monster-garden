@@ -41,6 +41,7 @@
 ## 補足・再申告トリガー
 
 1. **Q15（最重要）**: DevProduct 実IDを登録して販売開始する場合、`premium_seed_5` のランダム4シードとエッグ系のガチャ的商品説明により「有料ランダムアイテム=はい」+ Paid Random Items 開示が必要になる。回避するなら販売前に (a) `ShopService.grantProduct` の `math.random` 排除、(b) `ShopPrices.lua` のエッグ説明文を固定報酬表記に修正。
+   - **サブ設問（はい申告時）**: 「`ArePaidRandomItemsRestricted` のポリシーAPIを尊重していますか？」→ 現状 **PolicyService 未実装**（`PolicyService|GetPolicyInfoForPlayerAsync` grep 0件確認済 2026-07-06）。未実装のまま「はい（尊重）」申告は虚偽。**販売開始時は `PolicyService:GetPolicyInfoForPlayerAsync` で `ArePaidRandomItemsRestricted` を確認し、規制対象プレイヤーにはランダム商品を非表示にするガード実装が必須**（参照: https://create.roblox.com/docs/reference/engine/classes/PolicyService#GetPolicyInfoForPlayerAsync ）。
 2. **Q1**: GDD F16「モンスターバトル（3vs3ターン制）」（`game-design-document.md:83`）は未実装（優先度:低）。実装したら軽度カートゥーン暴力として再申告要。
 3. **Q16**: トレーディング（GDD F13）実装時は「はい」に更新要。
 4. 提出後: `mantle deploy --environment production` 再実行 → `targetAccess: public` 反映。確認は Open Cloud `GET cloud/v2/universes/10450862860` で `visibility: PUBLIC`。
