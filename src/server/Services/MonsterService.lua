@@ -2,41 +2,15 @@
 	MonsterService
 	モンスターの抽選ロジック（レアリティロール、スポーン条件チェック）を担当するサービス。
 	WeatherService からの天候・季節・時間帯情報を受け取り、スポーン条件に反映する。
+	v2: レアリティ抽選を Lib/RarityRoller に委譲。孵化用 rollMonster を維持。
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local MonsterDatabase = require(game.ReplicatedStorage.Shared.Config.MonsterDatabase)
-local SeedDatabase    = require(game.ReplicatedStorage.Shared.Config.SeedDatabase)
-
--- ------------------------------------------------------------------ constants
-
---- レアリティごとの基本重み（合計 100）
-local RARITY_WEIGHTS = {
-	Normal = 60,
-	Rare   = 25,
-	Epic   = 10,
-	Legend = 4,
-	Mythic = 1,
-}
-
---- lucky_gardener ゲームパス保持時のボーナス重み
-local LUCKY_GARDENER_BONUS = {
-	Normal = -10,
-	Rare   = 5,
-	Epic   = 3,
-	Legend = 1.5,
-	Mythic = 0.5,
-}
-
---- レアリティの序列（any_epic_or_above / any_legend_or_above フィルタ用）
-local RARITY_RANK = {
-	Normal = 1,
-	Rare   = 2,
-	Epic   = 3,
-	Legend = 4,
-	Mythic = 5,
-}
+local SeedDatabase = require(game.ReplicatedStorage.Shared.Config.SeedDatabase)
+local GameConfig = require(game.ReplicatedStorage.Shared.Config.GameConfig)
+local RarityRoller = require(ServerScriptService.Server.Lib.RarityRoller)
 
 -- ------------------------------------------------------------------ module
 
@@ -45,56 +19,29 @@ local MonsterService = {}
 -- ------------------------------------------------------------------ state
 
 --- 現在の天候（WeatherService から更新される）
-local currentWeather   = "Sunny"
+local currentWeather = "Sunny"
 --- 現在の季節（WeatherService から更新される）
-local currentSeason    = "Spring"
+local currentSeason = "Spring"
 --- 現在の時間帯（将来的に昼夜サイクルから更新される）
 local currentTimeOfDay = "Day"
 
 -- ------------------------------------------------------------------ prebuilt maps
 
---- id → モンスターデータ のマップ
+--- monsterId → モンスターデータ
 local monsterMap = {}
 for _, monster in ipairs(MonsterDatabase) do
 	monsterMap[monster.id] = monster
 end
 
---- id → シードデータ のマップ
+--- seedId → シードデータ
 local seedMap = {}
 for _, seed in ipairs(SeedDatabase) do
 	seedMap[seed.id] = seed
 end
 
--- ------------------------------------------------------------------ utility
+-- ------------------------------------------------------------------ spawn condition
 
---- 重みテーブルから加重ランダムにキーを選択して返す。
----@param weights table<string, number>
----@return string
-local function weightedRandom(weights)
-	local total = 0
-	for _, w in pairs(weights) do
-		total = total + w
-	end
-
-	local roll = math.random() * total
-	local cumulative = 0
-	for key, w in pairs(weights) do
-		cumulative = cumulative + w
-		if roll <= cumulative then
-			return key
-		end
-	end
-
-	-- フォールバック（浮動小数点誤差対策）
-	local lastKey
-	for key in pairs(weights) do
-		lastKey = key
-	end
-	return lastKey
-end
-
---- スポーン条件を現在の環境と照合する。
---- spawnCondition に指定されたキーがすべて一致する場合に true を返す。
+--- スポーン条件（天候/季節/時間帯）を満たすか。nil の条件は常に許可。
 ---@param condition table
 ---@return boolean
 local function checkSpawnCondition(condition)
@@ -107,7 +54,7 @@ local function checkSpawnCondition(condition)
 	if condition.timeOfDay and condition.timeOfDay ~= currentTimeOfDay then
 		return false
 	end
-	-- soilType は plantSeed 時に渡されるので、ここでは無視する（rollMonster の引数で対応）
+	-- soilType は rollMonster の引数で対応するため、ここでは無視する
 	return true
 end
 
@@ -119,22 +66,22 @@ function MonsterService.init()
 	print(string.format("[MonsterService] Initialized. Monster count: %d", count))
 end
 
---- 現在の天候を更新する（WeatherService から呼ばれる）。
+--- 現在の天候を更新する（WeatherService 連携）。
 ---@param weather string
 function MonsterService.setWeather(weather)
 	currentWeather = weather
 end
 
---- 現在の季節を更新する（WeatherService から呼ばれる）。
+--- 現在の季節を更新する（WeatherService 連携）。
 ---@param season string
 function MonsterService.setSeason(season)
 	currentSeason = season
 end
 
 --- 現在の時間帯を更新する（昼夜サイクルサービスから呼ばれる）。
----@param tod string
-function MonsterService.setTimeOfDay(tod)
-	currentTimeOfDay = tod
+---@param timeOfDay string
+function MonsterService.setTimeOfDay(timeOfDay)
+	currentTimeOfDay = timeOfDay
 end
 
 --- MonsterDatabase に登録されているモンスターの総数を返す。
@@ -147,100 +94,83 @@ function MonsterService.getMonsterCount()
 	return count
 end
 
---- プレイヤーのゲームパス状況を考慮してレアリティを抽選する。
----@param player Player
----@return string rarity
-function MonsterService.rollRarity(player)
-	-- 基本重みをコピー
-	local weights = {}
-	for rarity, w in pairs(RARITY_WEIGHTS) do
-		weights[rarity] = w
-	end
-
-	-- lucky_gardener ゲームパスのボーナス適用
-	local hasLuckyGardener = false
-	local DataService = require(game.ServerScriptService.Server.Services.DataService)
-	local data = DataService.getData(player)
-	if data and data.gamePasses and data.gamePasses["lucky_gardener"] == true then
-		hasLuckyGardener = true
-	end
-
-	if hasLuckyGardener then
-		for rarity, bonus in pairs(LUCKY_GARDENER_BONUS) do
-			weights[rarity] = math.max(0, (weights[rarity] or 0) + bonus)
-		end
-	end
-
-	return weightedRandom(weights)
+--- monsterId からモンスターデータを返す。
+---@param monsterId string
+---@return table|nil
+function MonsterService.getMonsterById(monsterId)
+	return monsterMap[monsterId]
 end
 
---- 種の属性・現在環境・スポーン条件を考慮してモンスターをロールする。
---- ガーデンから孵化時（GardenService.hatchEgg）に呼ばれる。
+--- プレイヤーのゲームパス・土壌を考慮してレアリティを抽選する。
 ---@param player Player
----@param seedId string
----@return table|nil monster
-function MonsterService.rollMonster(player, seedId)
-	local rarity = MonsterService.rollRarity(player)
-	local seed   = seedMap[seedId]
+---@param soilType string|nil
+---@return string rarity
+function MonsterService.rollRarity(player, soilType)
+	local DataService = require(ServerScriptService.Server.Services.DataService)
+	local data = DataService.getData(player)
+	local hasLucky = data and data.gamePasses and data.gamePasses.lucky_gardener == true
 
-	-- 特殊シード判定
-	local isAnyEpicOrAbove   = (seedId == "any_epic_or_above")
-	local isAnyLegendOrAbove = (seedId == "any_legend_or_above")
-	local skipAttributeFilter = isAnyEpicOrAbove or isAnyLegendOrAbove
-
-	-- any_epic_or_above / any_legend_or_above のレアリティ下限補正
-	if isAnyEpicOrAbove and RARITY_RANK[rarity] < RARITY_RANK["Epic"] then
-		rarity = "Epic"
-	elseif isAnyLegendOrAbove and RARITY_RANK[rarity] < RARITY_RANK["Legend"] then
-		rarity = "Legend"
+	local soilBonus = 0
+	if soilType and GameConfig.Soil[soilType] then
+		soilBonus = GameConfig.Soil[soilType].rarityBonus
 	end
 
+	return RarityRoller.rollRarity({ lucky = hasLucky, soilBonus = soilBonus })
+end
+
+--- シードと土壌からモンスターを1体抽選して返す（孵化用）。
+--- 失敗時は nil を返す。
+---@param player Player
+---@param seedId string
+---@param soilType string|nil
+---@return table|nil monster { id, rarity, attribute, hatchedAt, ... }
+function MonsterService.rollMonster(player, seedId, soilType)
+	local seed = seedMap[seedId]
+	local rarity = MonsterService.rollRarity(player, soilType)
+
 	local attribute = seed and seed.attribute or nil
+	local skipAttributeFilter = attribute == "All"
 
 	-- 候補モンスターを収集
 	local eligible = {}
 	for _, monster in ipairs(MonsterDatabase) do
-		-- レアリティ一致
-		if monster.rarity ~= rarity then
-			goto continue
-		end
-
-		-- 属性フィルタ（特殊シードはスキップ）
-		if not skipAttributeFilter then
-			if attribute and attribute ~= "All" and monster.attribute ~= attribute then
-				goto continue
+		local rarityOk = monster.rarity == rarity
+		local attributeOk = skipAttributeFilter or not attribute or monster.attribute == attribute
+		if rarityOk and attributeOk then
+			local condition = monster.spawnCondition or {}
+			if checkSpawnCondition(condition) then
+				-- シードの possibleMonsters 制約（定義があれば適用）
+				local inSeedPool = true
+				if seed and seed.possibleMonsters then
+					inSeedPool = false
+					for _, possibleId in ipairs(seed.possibleMonsters) do
+						if possibleId == monster.id then
+							inSeedPool = true
+							break
+						end
+					end
+				end
+				if inSeedPool then
+					table.insert(eligible, monster)
+				end
 			end
 		end
-
-		-- スポーン条件チェック（soilType は除外して天候/季節/時間帯のみ）
-		local cond = monster.spawnCondition or {}
-		local condCheck = {
-			weather   = cond.weather,
-			season    = cond.season,
-			timeOfDay = cond.timeOfDay,
-		}
-		if not checkSpawnCondition(condCheck) then
-			goto continue
-		end
-
-		table.insert(eligible, monster)
-
-		::continue::
 	end
 
 	-- 候補がなければフォールバック: 同属性の Normal モンスター（条件無視）
 	if #eligible == 0 then
-		warn(string.format(
-			"[MonsterService] No eligible monster (rarity=%s, attr=%s, weather=%s, season=%s). Falling back to Normal.",
-			rarity, tostring(attribute), currentWeather, currentSeason
-		))
+		warn(
+			string.format(
+				"[MonsterService] No eligible monster (rarity=%s, attr=%s, weather=%s, season=%s). Falling back to Normal.",
+				rarity,
+				tostring(attribute),
+				currentWeather,
+				currentSeason
+			)
+		)
 		for _, monster in ipairs(MonsterDatabase) do
 			if monster.rarity == "Normal" then
-				if not skipAttributeFilter and attribute and attribute ~= "All" then
-					if monster.attribute == attribute then
-						table.insert(eligible, monster)
-					end
-				else
+				if skipAttributeFilter or not attribute or monster.attribute == attribute then
 					table.insert(eligible, monster)
 				end
 			end
@@ -249,30 +179,20 @@ function MonsterService.rollMonster(player, seedId)
 
 	-- それでも候補がなければ nil を返す
 	if #eligible == 0 then
-		warn("[MonsterService] Fallback also found no candidates. Returning nil.")
+		warn("[MonsterService] Fallback also found no monster. seedId=" .. tostring(seedId))
 		return nil
 	end
 
-	-- ランダムに1体選択
-	local chosen = eligible[math.random(1, #eligible)]
-
-	-- 返却テーブル（データベースエントリのシャローコピー + 追加フィールド）
-	local result = {}
-	for k, v in pairs(chosen) do
-		result[k] = v
-	end
-	result.hatchedAt = os.time()
-	result.uniqueId  = chosen.id .. "_" .. tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
-
-	print(string.format(
-		"[MonsterService] Rolled %s (%s, %s) for %s",
-		result.id, result.rarity, result.attribute, player.Name
-	))
-
-	return result
+	local chosen = eligible[math.random(#eligible)]
+	return {
+		id = chosen.id,
+		rarity = chosen.rarity,
+		attribute = chosen.attribute,
+		baseValue = chosen.baseValue,
+		source = "hatch",
+		hatchedAt = os.time(),
+	}
 end
-
--- ------------------------------------------------------------------ state accessors
 
 --- 現在の天候を返す。
 ---@return string

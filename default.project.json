@@ -2,6 +2,12 @@
   "name": "MonsterGarden",
   "tree": {
     "$className": "DataModel",
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": {
+        "StreamingEnabled": true
+      }
+    },
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "Server": {

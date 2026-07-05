@@ -3,29 +3,34 @@
 	天候・季節サイクルを管理するサービス。
 	一定間隔で天候を抽選し、全クライアントへ通知する。
 	季節はリアルの月から決定し、セッション中は固定する。
+	v2: Remote を Net.lua 経由に統一。onChanged リスナーで他サービスへ同期する。
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players           = game:GetService("Players")
-
 local GameConfig = require(game.ReplicatedStorage.Shared.Config.GameConfig)
+local Net = require(game.ReplicatedStorage.Shared.Net)
 
 -- ------------------------------------------------------------------ constants
 
 --- 天候ごとの基本重み（合計 100）
 local WEATHER_WEIGHTS = {
+	Sunny = 45,
+	Rainy = 25,
+	Snowy = 15, -- Winter 以外の場合は Rainy に統合
+	Stormy = 10,
 	Rainbow = 5,
-	Rainy   = 25,
-	Snowy   = 15,  -- Winter 以外の場合は Rainy に差し替え
-	Stormy  = 10,
-	Sunny   = 45,
 }
 
---- 月 → 季節マッピング
+--- 月 → 季節マッピング（12/1/2 は Winter フォールバック）
 local MONTH_TO_SEASON = {
-	[3]  = "Spring", [4]  = "Spring", [5]  = "Spring",
-	[6]  = "Summer", [7]  = "Summer", [8]  = "Summer",
-	[9]  = "Autumn", [10] = "Autumn", [11] = "Autumn",
+	[3] = "Spring",
+	[4] = "Spring",
+	[5] = "Spring",
+	[6] = "Summer",
+	[7] = "Summer",
+	[8] = "Summer",
+	[9] = "Autumn",
+	[10] = "Autumn",
+	[11] = "Autumn",
 }
 
 -- ------------------------------------------------------------------ module
@@ -37,9 +42,11 @@ local WeatherService = {}
 --- 現在の天候
 local currentWeather = "Sunny"
 --- 現在の季節（リアル月から決定）
-local currentSeason  = "Spring"
+local currentSeason = "Spring"
 --- 天候変化タイマー（累積秒数）
-local weatherTimer   = 0
+local weatherTimer = 0
+--- 天候変化リスナー（サーバー内サービス連携用）
+local changeListeners = {}
 
 -- ------------------------------------------------------------------ utility
 
@@ -48,24 +55,20 @@ local weatherTimer   = 0
 ---@return string
 local function weightedRandom(weights)
 	local total = 0
-	for _, w in pairs(weights) do
-		total = total + w
+	for _, weight in pairs(weights) do
+		total = total + weight
 	end
-
 	local roll = math.random() * total
 	local cumulative = 0
-	for key, w in pairs(weights) do
-		cumulative = cumulative + w
+	local lastKey
+	for key, weight in pairs(weights) do
+		cumulative = cumulative + weight
+		lastKey = key
 		if roll <= cumulative then
 			return key
 		end
 	end
-
 	-- フォールバック（浮動小数点誤差対策）
-	local lastKey
-	for key in pairs(weights) do
-		lastKey = key
-	end
 	return lastKey
 end
 
@@ -76,58 +79,39 @@ local function getSeasonFromMonth()
 	return MONTH_TO_SEASON[month] or "Winter"
 end
 
--- ------------------------------------------------------------------ remotes
+-- ------------------------------------------------------------------ public API
 
---- WeatherUpdate RemoteEvent を取得するヘルパー。
----@return RemoteEvent|nil
-local function getWeatherUpdateEvent()
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	if not remotes then return nil end
-	return remotes:FindFirstChild("WeatherUpdate")
-end
-
--- ------------------------------------------------------------------ weather roll
-
---- 天候を抽選して currentWeather を更新し、変化があれば各クライアントへ通知する。
+--- 天候を抽選して更新し、変化があればクライアント・リスナーへ通知する。
 function WeatherService.rollWeather()
-	-- Winter 以外では Snowy を Rainy に統合した重みを使う
-	local weights = {}
-	for k, v in pairs(WEATHER_WEIGHTS) do
-		weights[k] = v
-	end
-
+	-- Winter 以外では Snowy の重みを Rainy に統合する
+	local weights = table.clone(WEATHER_WEIGHTS)
 	if currentSeason ~= "Winter" then
-		-- Snowy の重みを Rainy に加算して Snowy を除外
-		weights["Rainy"]  = weights["Rainy"] + weights["Snowy"]
-		weights["Snowy"]  = nil
+		weights.Rainy = weights.Rainy + weights.Snowy
+		weights.Snowy = nil
 	end
 
 	local newWeather = weightedRandom(weights)
-
-	local changed = (newWeather ~= currentWeather)
-	currentWeather = newWeather
-
-	-- MonsterService に天候変化を通知（循環依存を pcall で回避）
-	local ok, err = pcall(function()
-		local MonsterService = require(game.ServerScriptService.Server.Services.MonsterService)
-		MonsterService.setWeather(currentWeather)
-		MonsterService.setSeason(currentSeason)
-	end)
-	if not ok then
-		warn("[WeatherService] Failed to update MonsterService: " .. tostring(err))
+	if newWeather == currentWeather then
+		return
 	end
 
-	-- 変化があれば全クライアントへ通知
-	if changed then
-		local event = getWeatherUpdateEvent()
-		if event then
-			event:FireAllClients(currentWeather, currentSeason)
+	currentWeather = newWeather
+	print(string.format("[WeatherService] Weather changed → %s", currentWeather))
+
+	Net.event("WeatherUpdate"):FireAllClients(currentWeather, currentSeason)
+	for _, listener in ipairs(changeListeners) do
+		local ok, err = pcall(listener, currentWeather, currentSeason)
+		if not ok then
+			warn("[WeatherService] listener error: " .. tostring(err))
 		end
-		print(string.format("[WeatherService] Weather changed → %s (season: %s)", currentWeather, currentSeason))
 	end
 end
 
--- ------------------------------------------------------------------ public API
+--- 天候変化リスナーを登録する（サーバー内サービス用）。
+---@param listener fun(weather: string, season: string)
+function WeatherService.onChanged(listener)
+	table.insert(changeListeners, listener)
+end
 
 --- 現在の天候を返す。
 ---@return string
@@ -141,8 +125,7 @@ function WeatherService.getSeason()
 	return currentSeason
 end
 
---- ゲームループから毎フレーム呼ばれる更新処理。
---- GameConfig.Weather.ChangeInterval 秒ごとに天候を再抽選する。
+--- 毎フレーム呼ばれ、天候変化間隔を管理する。
 ---@param dt number
 function WeatherService.update(dt)
 	weatherTimer = weatherTimer + dt
@@ -155,35 +138,11 @@ end
 -- ------------------------------------------------------------------ init
 
 --- WeatherService を初期化する。
---- 季節を実際の月から決定し、Remotes を作成して初期天候を抽選する。
 function WeatherService.init()
-	-- 季節をリアル月から決定
 	currentSeason = getSeasonFromMonth()
 
-	-- Remotes フォルダ取得（DataService.init が先に実行済みで存在する）
-	local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
-	if not remotes then
-		warn("[WeatherService] Remotes folder not found.")
-		return
-	end
-
-	-- WeatherUpdate RemoteEvent
-	if not remotes:FindFirstChild("WeatherUpdate") then
-		local re = Instance.new("RemoteEvent")
-		re.Name   = "WeatherUpdate"
-		re.Parent = remotes
-	end
-
-	-- GetWeather RemoteFunction
-	if not remotes:FindFirstChild("GetWeather") then
-		local rf = Instance.new("RemoteFunction")
-		rf.Name   = "GetWeather"
-		rf.Parent = remotes
-	end
-
-	-- GetWeather ハンドラ（クライアントから現在状態を取得できる）
-	local getWeatherRF = remotes:WaitForChild("GetWeather")
-	getWeatherRF.OnServerInvoke = function(_player)
+	-- クライアントから現在状態を取得できる
+	Net.func("GetWeather").OnServerInvoke = function(_player)
 		return { weather = currentWeather, season = currentSeason }
 	end
 

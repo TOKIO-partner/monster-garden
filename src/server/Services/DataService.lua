@@ -1,37 +1,48 @@
 --[[
 	DataService
 	プレイヤーデータの永続化・読み込み・更新を担当するサービス。
-	DataStoreService を使い、リトライ付きで安全に保存・取得する。
+	v2: オープンワールド化スキーマ。inventory（seeds/capturedMonsters）と
+	garden.plots 構造を導入し、v1 データ（MonsterGardenData_v1）を初回ロード時に
+	自動マイグレーションする。v1 ストアは削除せず残す（ロールバック保険）。
 ]]
 
 local DataStoreService = game:GetService("DataStoreService")
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Net = require(game.ReplicatedStorage.Shared.Net)
 
 -- ------------------------------------------------------------------ constants
 
-local DATASTORE_NAME = "MonsterGardenData_v1"
-local MAX_RETRIES    = 3
-local AUTOSAVE_INTERVAL = 120   -- seconds
-local MAX_OFFLINE_SECONDS = 28800  -- 8 hours
+local DATASTORE_NAME_V2 = "MonsterGardenData_v2"
+local DATASTORE_NAME_V1 = "MonsterGardenData_v1"
+local MAX_RETRIES = 3
+local AUTOSAVE_INTERVAL = 120 -- seconds
+local MAX_OFFLINE_SECONDS = 28800 -- 8 hours
 
 -- ------------------------------------------------------------------ defaults
 
---- プレイヤーデータのデフォルト値テンプレート。
+--- プレイヤーデータのデフォルト値テンプレート（スキーマ v2）。
 local DEFAULT_DATA = {
-	coins   = 500,
-	seeds   = { "fire_seed", "water_seed", "grass_seed" },
-	garden  = {},   -- plotIndex → plotData
-	monsters = {},  -- array of { monsterId, name, rarity, ... }
-	collection = {},  -- set of discovered monster IDs: { monsterId = true }
+	schemaVersion = 2,
+	coins = 500,
+	inventory = {
+		seeds = { "fire_seed", "water_seed", "grass_seed" },
+		capturedMonsters = {}, -- 野生捕獲したモンスター（庭園展示前の手持ち）
+	},
+	garden = {
+		plots = {}, -- plotIndex → plotData
+	},
+	monsters = {}, -- 孵化・捕獲済みモンスターの配列
+	collection = {}, -- 発見済み図鑑: { monsterId = true }
 	stats = {
-		totalMonsters  = 0,
-		loginStreak    = 0,
-		lastLoginDate  = "",
+		totalMonsters = 0,
+		totalCaptures = 0,
+		loginStreak = 0,
+		lastLoginDate = "",
 		lastLogoutTime = 0,
 	},
-	gamePasses = {},  -- { passId = true }
+	gamePasses = {}, -- { passId = true }
 	settings = {
 		language = "ja",
 	},
@@ -42,9 +53,10 @@ local DEFAULT_DATA = {
 local DataService = {}
 
 -- DataStore インスタンス
-local playerDataStore
+local dataStoreV2
+local dataStoreV1
 
--- ランタイムキャッシュ: player.UserId → data table
+-- ランタイムキャッシュ: player.UserId → table
 local playerCache = {}
 
 -- autosave タイマー
@@ -67,61 +79,90 @@ local function deepCopy(original)
 	return copy
 end
 
---- デフォルトデータをベースに、保存済みデータをマージして返す。
---- 保存済みデータに存在しないキーはデフォルト値で補完する。
----@param saved table
----@return table
-local function mergeWithDefaults(saved)
-	local result = deepCopy(DEFAULT_DATA)
-	for key, value in pairs(saved) do
-		if type(value) == "table" and type(result[key]) == "table" then
-			-- ネストしたテーブルは再帰マージ
-			for k, v in pairs(value) do
-				result[key][k] = v
+--- デフォルト値で欠損キーを再帰的に補完する（既存値は保持）。
+---@param data table
+---@param defaults table
+local function mergeWithDefaults(data, defaults)
+	for key, defaultValue in pairs(defaults) do
+		if data[key] == nil then
+			if type(defaultValue) == "table" then
+				data[key] = deepCopy(defaultValue)
+			else
+				data[key] = defaultValue
 			end
-		else
-			result[key] = value
+		elseif type(defaultValue) == "table" and type(data[key]) == "table" then
+			-- 配列（連番）はそのまま、辞書のみ再帰補完
+			if #defaultValue == 0 then
+				mergeWithDefaults(data[key], defaultValue)
+			end
 		end
 	end
-	return result
 end
 
---- 今日の日付文字列を返す（YYYY-MM-DD）。
+--- 今日の日付文字列（YYYY-MM-DD）を返す。
 ---@return string
-local function getTodayDateString()
+local function todayString()
 	return tostring(os.date("%Y-%m-%d"))
+end
+
+-- ------------------------------------------------------------------ migration
+
+--- v1 スキーマのデータを v2 に変換する。
+--- v1: { coins, seeds, garden(plotIndex→plotData), monsters, collection, stats, gamePasses, settings }
+---@param v1Data table
+---@return table v2Data
+local function migrateV1ToV2(v1Data)
+	local v2Data = deepCopy(DEFAULT_DATA)
+
+	v2Data.coins = v1Data.coins or DEFAULT_DATA.coins
+	v2Data.inventory.seeds = v1Data.seeds or deepCopy(DEFAULT_DATA.inventory.seeds)
+	v2Data.garden.plots = v1Data.garden or {}
+	v2Data.monsters = v1Data.monsters or {}
+	v2Data.collection = v1Data.collection or {}
+	v2Data.gamePasses = v1Data.gamePasses or {}
+	v2Data.settings = v1Data.settings or deepCopy(DEFAULT_DATA.settings)
+
+	if v1Data.stats then
+		for key, value in pairs(v1Data.stats) do
+			v2Data.stats[key] = value
+		end
+	end
+	v2Data.stats.totalCaptures = v2Data.stats.totalCaptures or 0
+
+	return v2Data
 end
 
 -- ------------------------------------------------------------------ DataStore I/O
 
---- DataStore からデータを取得する（リトライ付き）。
+--- DataStore からデータを取得する（リトライ付き・指数バックオフ）。
+---@param store DataStore
 ---@param key string
 ---@return table|nil
-local function getFromStore(key)
+local function getFromStore(store, key)
 	for attempt = 1, MAX_RETRIES do
 		local ok, result = pcall(function()
-			return playerDataStore:GetAsync(key)
+			return store:GetAsync(key)
 		end)
 		if ok then
 			return result
 		end
 		warn("[DataService] GetAsync failed (attempt " .. attempt .. "/" .. MAX_RETRIES .. "): " .. tostring(result))
 		if attempt < MAX_RETRIES then
-			-- 指数バックオフ: 2^attempt 秒待機
 			task.wait(2 ^ attempt)
 		end
 	end
 	return nil
 end
 
---- DataStore にデータを保存する（リトライ付き）。
+--- DataStore にデータを保存する（リトライ付き・指数バックオフ）。
+---@param store DataStore
 ---@param key string
 ---@param data table
 ---@return boolean
-local function setToStore(key, data)
+local function setToStore(store, key, data)
 	for attempt = 1, MAX_RETRIES do
 		local ok, err = pcall(function()
-			playerDataStore:SetAsync(key, data)
+			store:SetAsync(key, data)
 		end)
 		if ok then
 			return true
@@ -134,68 +175,21 @@ local function setToStore(key, data)
 	return false
 end
 
--- ------------------------------------------------------------------ RemoteStorage setup
-
---- ReplicatedStorage に Remotes フォルダと Remote オブジェクトを作成する。
-local function setupRemotes()
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	if not remotes then
-		remotes = Instance.new("Folder")
-		remotes.Name = "Remotes"
-		remotes.Parent = ReplicatedStorage
-	end
-
-	-- GetPlayerData: クライアントからのデータ取得リクエスト
-	if not remotes:FindFirstChild("GetPlayerData") then
-		local rf = Instance.new("RemoteFunction")
-		rf.Name = "GetPlayerData"
-		rf.Parent = remotes
-	end
-
-	-- UpdatePlayerData: サーバーからクライアントへのデータ同期
-	if not remotes:FindFirstChild("UpdatePlayerData") then
-		local re = Instance.new("RemoteEvent")
-		re.Name = "UpdatePlayerData"
-		re.Parent = remotes
-	end
-
-	-- GetPlayerData ハンドラ
-	local getPlayerDataRF = remotes:WaitForChild("GetPlayerData")
-	getPlayerDataRF.OnServerInvoke = function(player)
-		return DataService.getData(player)
-	end
-end
-
 -- ------------------------------------------------------------------ login streak
 
---- ログインストリークを計算して更新する。
----@param data table
-local function updateLoginStreak(data)
-	local today = getTodayDateString()
-	local stats = data.stats
-
-	if stats.lastLoginDate == "" then
-		-- 初回ログイン
-		stats.loginStreak   = 1
-		stats.lastLoginDate = today
-		return
-	end
-
+--- 連続ログイン日数を更新する。
+---@param stats table
+local function updateLoginStreak(stats)
+	local today = todayString()
 	if stats.lastLoginDate == today then
-		-- 同日ログイン：変更なし
-		return
+		return -- 同日ログイン: 変更なし
 	end
 
-	-- 昨日ログインしていたか確認（簡易判定：lastLoginDate と today の差が ~1日）
-	-- Roblox では os.date が使えるが差分計算は os.time() ベースで行う
-	-- lastLoginDate は文字列なので os.time への変換は省略し、
-	-- stats.lastLogoutTime（エポック秒）を使って判定する
 	local secondsSinceLogout = os.time() - (stats.lastLogoutTime or 0)
-	if secondsSinceLogout < 172800 then
+	if stats.lastLoginDate ~= "" and secondsSinceLogout < 172800 then
 		-- 48時間以内なら連続ログインとみなす
-		stats.loginStreak   = (stats.loginStreak or 0) + 1
+		stats.loginStreak = (stats.loginStreak or 0) + 1
 	else
-		-- ストリークリセット
 		stats.loginStreak = 1
 	end
 	stats.lastLoginDate = today
@@ -214,7 +208,6 @@ local function setupLeaderstats(player, data)
 		leaderstats.Parent = player
 	end
 
-	-- Coins
 	local coins = leaderstats:FindFirstChild("Coins")
 	if not coins then
 		coins = Instance.new("IntValue")
@@ -223,51 +216,55 @@ local function setupLeaderstats(player, data)
 	end
 	coins.Value = data.coins or 0
 
-	-- Monsters
 	local monsters = leaderstats:FindFirstChild("Monsters")
 	if not monsters then
 		monsters = Instance.new("IntValue")
 		monsters.Name = "Monsters"
 		monsters.Parent = leaderstats
 	end
-	monsters.Value = data.stats and data.stats.totalMonsters or 0
+	monsters.Value = (data.stats and data.stats.totalMonsters) or 0
 end
 
 -- ------------------------------------------------------------------ public API
 
---- プレイヤーデータを DataStore から読み込み、キャッシュに格納する。
+--- プレイヤーデータを読み込みキャッシュに格納する。
+--- v2 に無ければ v1 を読んでマイグレーションし、v2 として保存する。
 ---@param player Player
 function DataService.loadData(player)
 	local key = "player_" .. player.UserId
-	local saved = getFromStore(key)
 
-	local data
-	if saved then
-		data = mergeWithDefaults(saved)
+	local data = getFromStore(dataStoreV2, key)
+	if not data then
+		-- v1 からのマイグレーションを試みる
+		local v1Data = getFromStore(dataStoreV1, key)
+		if v1Data then
+			data = migrateV1ToV2(v1Data)
+			print("[DataService] Migrated v1 → v2 for " .. player.Name)
+			-- 即時 v2 保存（v1 は残す）
+			setToStore(dataStoreV2, key, data)
+		else
+			data = deepCopy(DEFAULT_DATA)
+			print("[DataService] New player: " .. player.Name)
+		end
+	end
+
+	mergeWithDefaults(data, DEFAULT_DATA)
+	data.schemaVersion = 2
+
+	-- オフライン経過秒数を一時フィールドに記録（GardenService が消費）
+	local lastLogout = (data.stats and data.stats.lastLogoutTime) or 0
+	if lastLogout > 0 then
+		data._offlineSeconds = math.min(os.time() - lastLogout, MAX_OFFLINE_SECONDS)
 	else
-		data = deepCopy(DEFAULT_DATA)
-		print("[DataService] New player: " .. player.Name)
+		data._offlineSeconds = 0
 	end
 
-	-- オフライン経過秒数の計算（最大 8 時間）
-	local offlineSeconds = 0
-	if data.stats.lastLogoutTime and data.stats.lastLogoutTime > 0 then
-		local elapsed = os.time() - data.stats.lastLogoutTime
-		offlineSeconds = math.min(elapsed, MAX_OFFLINE_SECONDS)
-	end
-	data._offlineSeconds = offlineSeconds
+	updateLoginStreak(data.stats)
 
-	-- ログインストリーク更新
-	updateLoginStreak(data)
-
-	-- キャッシュ格納
 	playerCache[player.UserId] = data
-
-	-- leaderstats 作成
 	setupLeaderstats(player, data)
 
-	print(string.format("[DataService] Loaded data for %s (offline: %ds)", player.Name, offlineSeconds))
-	return data
+	print("[DataService] Loaded data for " .. player.Name)
 end
 
 --- プレイヤーデータを DataStore に保存する。
@@ -279,13 +276,12 @@ function DataService.saveData(player)
 		return
 	end
 
-	-- 保存前に lastLogoutTime を更新
 	data.stats.lastLogoutTime = os.time()
 	-- _offlineSeconds は一時フィールドなので保存しない
 	data._offlineSeconds = nil
 
 	local key = "player_" .. player.UserId
-	local success = setToStore(key, data)
+	local success = setToStore(dataStoreV2, key, data)
 	if success then
 		print("[DataService] Saved data for " .. player.Name)
 	else
@@ -300,31 +296,26 @@ function DataService.getData(player)
 	return playerCache[player.UserId]
 end
 
---- プレイヤーデータの特定キーを更新し、RemoteEvent でクライアントに通知する。
+--- プレイヤーデータの特定キーを更新し、クライアントに通知する。
 ---@param player Player
 ---@param key string
 ---@param value any
 function DataService.updateData(player, key, value)
 	local data = playerCache[player.UserId]
-	if not data then return end
+	if not data then
+		return
+	end
 	data[key] = value
 
 	-- leaderstats の同期
 	if key == "coins" then
-		local ls = player:FindFirstChild("leaderstats")
-		if ls and ls:FindFirstChild("Coins") then
-			ls.Coins.Value = value
+		local leaderstats = player:FindFirstChild("leaderstats")
+		if leaderstats and leaderstats:FindFirstChild("Coins") then
+			leaderstats.Coins.Value = value
 		end
 	end
 
-	-- クライアントへ通知
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	if remotes then
-		local updateEvent = remotes:FindFirstChild("UpdatePlayerData")
-		if updateEvent then
-			updateEvent:FireClient(player, key, value)
-		end
-	end
+	Net.event("UpdatePlayerData"):FireClient(player, key, value)
 end
 
 --- コインを加算する。
@@ -332,18 +323,22 @@ end
 ---@param amount number
 function DataService.addCoins(player, amount)
 	local data = playerCache[player.UserId]
-	if not data then return end
+	if not data then
+		return
+	end
 	data.coins = (data.coins or 0) + amount
 	DataService.updateData(player, "coins", data.coins)
 end
 
---- コインを消費する。所持金が足りなければ false を返す。
+--- コインを消費する。残高不足なら false。
 ---@param player Player
 ---@param amount number
 ---@return boolean
 function DataService.spendCoins(player, amount)
 	local data = playerCache[player.UserId]
-	if not data then return false end
+	if not data then
+		return false
+	end
 	if (data.coins or 0) < amount then
 		return false
 	end
@@ -352,23 +347,41 @@ function DataService.spendCoins(player, amount)
 	return true
 end
 
+--- 統計値をインクリメントし leaderstats を同期する。
+---@param player Player
+---@param statKey string
+---@param delta number|nil 省略時 1
+function DataService.incrementStat(player, statKey, delta)
+	local data = playerCache[player.UserId]
+	if not data then
+		return
+	end
+	data.stats[statKey] = (data.stats[statKey] or 0) + (delta or 1)
+
+	if statKey == "totalMonsters" then
+		local leaderstats = player:FindFirstChild("leaderstats")
+		if leaderstats and leaderstats:FindFirstChild("Monsters") then
+			leaderstats.Monsters.Value = data.stats.totalMonsters
+		end
+	end
+end
+
 -- ------------------------------------------------------------------ init
 
---- DataService を初期化する。DataStore・Remotes・PlayerAdded/Removing・autosave を設定する。
+--- DataService を初期化する。
 function DataService.init()
-	-- DataStore 作成
-	playerDataStore = DataStoreService:GetDataStore(DATASTORE_NAME)
-	print("[DataService] DataStore ready: " .. DATASTORE_NAME)
+	dataStoreV2 = DataStoreService:GetDataStore(DATASTORE_NAME_V2)
+	dataStoreV1 = DataStoreService:GetDataStore(DATASTORE_NAME_V1)
 
-	-- Remotes セットアップ
-	setupRemotes()
+	-- クライアントからのデータ取得
+	Net.func("GetPlayerData").OnServerInvoke = function(player)
+		return playerCache[player.UserId]
+	end
 
-	-- PlayerAdded
+	-- PlayerAdded / 既接続プレイヤー
 	Players.PlayerAdded:Connect(function(player)
 		DataService.loadData(player)
 	end)
-
-	-- 既に入室済みのプレイヤーへの対応（テスト環境など）
 	for _, player in ipairs(Players:GetPlayers()) do
 		DataService.loadData(player)
 	end
@@ -379,7 +392,7 @@ function DataService.init()
 		playerCache[player.UserId] = nil
 	end)
 
-	-- Autosave ループ（RunService.Heartbeat で累積、120秒ごとに保存）
+	-- Autosave ループ
 	RunService.Heartbeat:Connect(function(dt)
 		autosaveTimer = autosaveTimer + dt
 		if autosaveTimer >= AUTOSAVE_INTERVAL then
@@ -399,7 +412,7 @@ function DataService.init()
 		print("[DataService] BindToClose: done.")
 	end)
 
-	print("[DataService] Initialized.")
+	print("[DataService] Initialized (schema v2).")
 end
 
 return DataService

@@ -1,0 +1,50 @@
+# TestEZ グローバル定義（selene 用標準ライブラリ）
+# *.spec.lua 内の describe / it / expect などを許可する
+globals:
+  describe:
+    args:
+      - type: string
+      - type: function
+  it:
+    args:
+      - type: string
+      - type: function
+  itSKIP:
+    args:
+      - type: string
+      - type: function
+  itFOCUS:
+    args:
+      - type: string
+      - type: function
+  describeSKIP:
+    args:
+      - type: string
+      - type: function
+  describeFOCUS:
+    args:
+      - type: string
+      - type: function
+  beforeAll:
+    args:
+      - type: function
+  beforeEach:
+    args:
+      - type: function
+  afterAll:
+    args:
+      - type: function
+  afterEach:
+    args:
+      - type: function
+  expect:
+    args:
+      - type: "..."
+  FIXME:
+    args:
+      - type: "..."
+        required: false
+  FOCUS:
+    args: []
+  SKIP:
+    args: []
