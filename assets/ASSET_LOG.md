@@ -36,18 +36,28 @@
 
 ### Roblox アップロード状況
 
-⚠️ **保留中（2026-07-05）**: monster-garden の Roblox ゲーム所有者が group 47115687（nowordsescape と同じ）**ではない**ことが判明。
-正しい所有者（user/group + ID + APIキー）確定後に以下を実行する:
+✅ **全12音アップロード完了（2026-07-05）**: 所有者 = **Storix_Dev 個人（UserId 10710842340）**。
+キーは `ゲーム開発/Roblox/.env` の ROBLOX_OPENCLOUD_API_KEY を monster-garden/.env に流用。
 
-```bash
-# .env を作成（.env.example 参照）して:
-scripts/upload-audio.sh --dry-run
-scripts/upload-audio.sh          # → Audio.lua に assetId 自動反映
-```
+| slot | assetId |
+|------|---------|
+| bgm.meadow | 79607195312812 |
+| bgm.volcano | 131800794197125 |
+| bgm.lakeside | 129287744081710 |
+| bgm.island | 97974576842640 |
+| se.captureSuccess | 123704618833869 |
+| se.captureFail | 83995567265201 |
+| se.hatch | 73231273316593 |
+| se.plant | 81695530257320 |
+| se.water | 115921048490622 |
+| se.warp | 112943681354335 |
+| se.uiClick | 73725425165027 |
+| se.rareSeed | 100471882669496 |
 
-- 音声アセットは**ゲーム本体と同一所有者でないと再生不可**（Roblox音声プライバシー制限）
+- Audio.lua に全ID反映済（プレースホルダ 0 なし）
+- ⚠️ monster-garden の Universe/Place も **Storix_Dev 所有で作成すること**（音声はゲーム本体と同一所有者でないと再生不可）
 - モデル（.glb）は Open Cloud が fbx/obj のみ対応のため、Blender で FBX 変換してからアップする（未実施）
-- モデレーションタイムアウト時は operationId を控えて再実行で回収（nowordsescape 落とし穴集参照）
+- warp はモデレーションで60秒TO → operationId 個別ポーリングで回収（スクリプトに実装済み）
 
 ### 落とし穴メモ（横展開済み）
 

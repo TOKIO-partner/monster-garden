@@ -126,11 +126,27 @@ for entry in "${ENTRIES[@]}"; do
 		echo "  ERROR: $output" >&2
 		continue
 	}
-	asset_id=$(printf '%s' "$output" | grep -oE 'assetId: ?"?[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+	asset_id=$(printf '%s' "$output" | grep -oE '"assetId":"[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+
+	# assetId が直接返らない場合: operationId をポーリングして回収（最大60秒）
 	if [ -z "$asset_id" ]; then
-		# モデレーション待ちで operationId のみの場合: id を控えて再実行で回収
-		echo "  pending (moderation?): $output"
-		continue
+		operation_id=$(printf '%s' "$output" | grep -oE 'operations/[0-9a-f-]+' | head -1 | cut -d/ -f2 || true)
+		if [ -z "$operation_id" ]; then
+			echo "  ERROR (no operation): $output" >&2
+			continue
+		fi
+		echo "  polling operation: $operation_id"
+		for _ in $(seq 1 12); do
+			sleep 5
+			poll=$(curl -sS "https://apis.roblox.com/assets/v1/operations/$operation_id" \
+				-H "x-api-key: $RBXCLOUD_API_KEY")
+			asset_id=$(printf '%s' "$poll" | grep -oE '"assetId":"[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+			[ -n "$asset_id" ] && break
+		done
+		if [ -z "$asset_id" ]; then
+			echo "  pending (timeout): operationId=$operation_id （再実行で回収）" >&2
+			continue
+		fi
 	fi
 	update_audio_lua "$category" "$slot" "$asset_id"
 done

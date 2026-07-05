@@ -8,22 +8,22 @@
 return {
 	--- バイオーム/エリア別 BGM（bgmKey → assetId）
 	bgm = {
-		meadow = 0, -- そよかぜ草原
-		volcano = 0, -- ごうか火山
-		lakeside = 0, -- みずうみのほとり
-		island = 0, -- 庭園島（ホーム）
+		meadow = 79607195312812, -- そよかぜ草原
+		volcano = 131800794197125, -- ごうか火山
+		lakeside = 129287744081710, -- みずうみのほとり
+		island = 97974576842640, -- 庭園島（ホーム）
 	},
 
 	--- 効果音
 	se = {
-		captureSuccess = 0, -- 捕獲成功
-		captureFail = 0, -- 捕獲失敗（逃走）
-		hatch = 0, -- 孵化
-		plant = 0, -- 種植え
-		water = 0, -- 水やり
-		warp = 0, -- ワープ
-		uiClick = 0, -- UI操作
-		rareSeed = 0, -- レアシード採取
+		captureSuccess = 123704618833869, -- 捕獲成功
+		captureFail = 83995567265201, -- 捕獲失敗（逃走）
+		hatch = 73231273316593, -- 孵化
+		plant = 81695530257320, -- 種植え
+		water = 115921048490622, -- 水やり
+		warp = 112943681354335, -- ワープ
+		uiClick = 73725425165027, -- UI操作
+		rareSeed = 100471882669496, -- レアシード採取
 	},
 
 	--- BGM 音量（0-1）
