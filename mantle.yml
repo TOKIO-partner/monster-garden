@@ -1,0 +1,24 @@
+# Mantle 構成 — Monster Garden
+# 初回 deploy で Universe/Place を新規作成する（Studio 手動 Publish 不要化）
+# 認証: ROBLOSECURITY 環境変数（scripts/extract-studio-cookie.py で抽出）
+owner: personal
+
+environments:
+  - label: production
+    targetAccess: public
+
+target:
+  experience:
+    configuration:
+      genre: adventure
+      playableDevices: [computer, phone, tablet]
+    places:
+      start:
+        file: game.rbxl
+        configuration:
+          name: Monster Garden
+          description: |
+            モンスターを捕まえて自分だけの庭園を育てるオープンワールド。
+            Catch monsters across wild biomes and grow your own garden!
+          maxPlayerCount: 20
+          serverFill: robloxOptimized
